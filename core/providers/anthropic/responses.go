@@ -192,12 +192,13 @@ type anthropicToResponsesStreamState struct {
 	nextBlockIndex   int
 	blockIndexByItem map[string]int
 
-	// emittedTextByBlock holds bounded progress for text that actually reached a
-	// normalized Anthropic client. Responses output_text.done is cumulative, while
-	// Anthropic clients assemble incremental content_block_delta events, so the
-	// converter needs this state to recover only a verified missing suffix without
-	// retaining a second full copy of the streamed response.
-	emittedTextByBlock map[int]*emittedTextProgress
+	// emittedDeltaByBlock holds bounded progress for text and tool input that
+	// actually reached a normalized Anthropic client. Responses output_text.done and
+	// *_arguments.done are cumulative, while Anthropic clients assemble incremental
+	// content_block_delta events, so the converter needs this state to recover only
+	// a verified missing suffix without retaining a second full copy of the streamed
+	// response.
+	emittedDeltaByBlock map[int]*emittedDeltaProgress
 
 	// blockIndexMisses records non-empty item keys for which blockIndexFor was
 	// asked for an index that allocBlockIndex never assigned — i.e. a
@@ -268,57 +269,64 @@ type anthropicToResponsesStreamState struct {
 	codeExecServerClosedByItem map[string]bool
 }
 
-// emittedTextProgress records one Anthropic text block's wire-visible prefix.
-// emittedBytes locates the possible terminal suffix, while prefixHasher proves
-// that output_text.done still extends the exact bytes already sent. Keeping only
-// the count and digest makes the bookkeeping bounded regardless of output size.
-type emittedTextProgress struct {
+// emittedDeltaProgress records one Anthropic text or tool block's wire-visible
+// prefix. emittedBytes locates the possible terminal suffix, while prefixHasher
+// proves that the cumulative done event still extends the exact bytes already
+// sent. Keeping only the count and digest makes the bookkeeping bounded regardless
+// of output size.
+type emittedDeltaProgress struct {
 	emittedBytes int
 	prefixHasher hash.Hash
 }
 
-// recordEmittedText advances one block's bounded progress after a text delta is
-// known to be client-visible.
-func (s *anthropicToResponsesStreamState) recordEmittedText(blockIndex int, text string) {
+// recordEmittedDelta advances one block's bounded progress after a text or
+// input_json delta is known to be client-visible.
+func (s *anthropicToResponsesStreamState) recordEmittedDelta(blockIndex int, text string) {
 	if text == "" {
 		return
 	}
-	if s.emittedTextByBlock == nil {
-		s.emittedTextByBlock = make(map[int]*emittedTextProgress)
+	if s.emittedDeltaByBlock == nil {
+		s.emittedDeltaByBlock = make(map[int]*emittedDeltaProgress)
 	}
-	progress := s.emittedTextByBlock[blockIndex]
+	progress := s.emittedDeltaByBlock[blockIndex]
 	if progress == nil {
-		progress = &emittedTextProgress{prefixHasher: sha256.New()}
-		s.emittedTextByBlock[blockIndex] = progress
+		progress = &emittedDeltaProgress{prefixHasher: sha256.New()}
+		s.emittedDeltaByBlock[blockIndex] = progress
 	}
 	_, _ = progress.prefixHasher.Write([]byte(text))
 	progress.emittedBytes += len(text)
 }
 
-// recordEmittedTextEvents tracks only text deltas that survived protocol
-// validation and will reach the normalized client. Raw passthrough frames remain
-// authoritative, so the converter must neither track nor later supplement them.
-func (s *anthropicToResponsesStreamState) recordEmittedTextEvents(events []*AnthropicStreamEvent) {
+// recordEmittedDeltaEvents tracks only text and input_json deltas that survived
+// protocol validation and will reach the normalized client. Raw passthrough frames
+// remain authoritative, so the converter must neither track nor later supplement
+// them.
+func (s *anthropicToResponsesStreamState) recordEmittedDeltaEvents(events []*AnthropicStreamEvent) {
 	if s.passthrough {
 		return
 	}
 	for _, event := range events {
-		if event == nil || event.Type != AnthropicStreamEventTypeContentBlockDelta || event.Index == nil ||
-			event.Delta == nil || event.Delta.Type != AnthropicStreamDeltaTypeText || event.Delta.Text == nil {
+		if event == nil || event.Type != AnthropicStreamEventTypeContentBlockDelta || event.Index == nil || event.Delta == nil {
 			continue
 		}
-		s.recordEmittedText(*event.Index, *event.Delta.Text)
+		switch {
+		case event.Delta.Type == AnthropicStreamDeltaTypeText && event.Delta.Text != nil:
+			s.recordEmittedDelta(*event.Index, *event.Delta.Text)
+		case event.Delta.Type == AnthropicStreamDeltaTypeInputJSON && event.Delta.PartialJSON != nil:
+			s.recordEmittedDelta(*event.Index, *event.Delta.PartialJSON)
+		}
 	}
 }
 
-// missingTerminalText returns the append-only suffix not present in prior
-// client-visible deltas. Responses output_text.done carries cumulative text, so
-// the emitted prefix must match byte-for-byte before the remainder can safely be
-// converted into an Anthropic delta; a shorter or divergent aggregate is rejected
-// instead of duplicating or guessing client-visible content.
-func (s *anthropicToResponsesStreamState) missingTerminalText(blockIndex int, aggregate string) (string, bool) {
+// missingTerminalSuffix returns the append-only suffix not present in prior
+// client-visible deltas. Responses output_text.done and *_arguments.done carry the
+// cumulative value, so the emitted prefix must match byte-for-byte before the
+// remainder can safely be converted into an Anthropic delta; a shorter or
+// divergent aggregate is rejected instead of duplicating or guessing
+// client-visible content.
+func (s *anthropicToResponsesStreamState) missingTerminalSuffix(blockIndex int, aggregate string) (string, bool) {
 	emittedBytes := 0
-	if progress := s.emittedTextByBlock[blockIndex]; progress != nil {
+	if progress := s.emittedDeltaByBlock[blockIndex]; progress != nil {
 		emittedBytes = progress.emittedBytes
 		if emittedBytes > len(aggregate) {
 			return "", false
@@ -332,14 +340,14 @@ func (s *anthropicToResponsesStreamState) missingTerminalText(blockIndex int, ag
 	return missing, missing != ""
 }
 
-// clearEmittedTextProgress releases terminal-text bookkeeping once
+// clearEmittedDeltaProgress releases terminal-suffix bookkeeping once
 // output_item.done closes the corresponding Anthropic content block.
-func (s *anthropicToResponsesStreamState) clearEmittedTextProgress(key string) {
-	if key == "" || s.blockIndexByItem == nil || s.emittedTextByBlock == nil {
+func (s *anthropicToResponsesStreamState) clearEmittedDeltaProgress(key string) {
+	if key == "" || s.blockIndexByItem == nil || s.emittedDeltaByBlock == nil {
 		return
 	}
 	if blockIndex, ok := s.blockIndexByItem[key]; ok {
-		delete(s.emittedTextByBlock, blockIndex)
+		delete(s.emittedDeltaByBlock, blockIndex)
 	}
 }
 
@@ -3350,7 +3358,7 @@ func ToAnthropicResponsesStreamResponse(ctx *schemas.BifrostContext, bifrostResp
 	}
 	state := getOrCreateAnthropicToResponsesStreamState(ctx)
 	events = enforceStreamBlockTypes(state, events)
-	state.recordEmittedTextEvents(events)
+	state.recordEmittedDeltaEvents(events)
 	// The terminal frame is the last one that can carry usage worth reshaping, so
 	// the prompt-usage readings are released once it has been rendered -- here,
 	// rather than when the reader goroutine returned, because this frame is
@@ -3836,7 +3844,7 @@ func toAnthropicResponsesStreamEvents(ctx *schemas.BifrostContext, bifrostResp *
 		if !ok || state.blockType(blockIndex) != AnthropicContentBlockTypeText {
 			return nil
 		}
-		missing, ok := state.missingTerminalText(blockIndex, *bifrostResp.Text)
+		missing, ok := state.missingTerminalSuffix(blockIndex, *bifrostResp.Text)
 		if !ok {
 			return nil
 		}
@@ -3869,6 +3877,37 @@ func toAnthropicResponsesStreamEvents(ctx *schemas.BifrostContext, bifrostResp *
 				Type:        AnthropicStreamDeltaTypeInputJSON,
 				PartialJSON: bifrostResp.Delta,
 			}
+		}
+
+	case schemas.ResponsesStreamResponseTypeFunctionCallArgumentsDone,
+		schemas.ResponsesStreamResponseTypeMCPCallArgumentsDone:
+		// OpenAI may stream a call with no arguments deltas at all (it does for
+		// parallel calls) and carry the arguments only in the cumulative done event.
+		// Anthropic has no equivalent event, so, as for output_text.done, emit only the
+		// verified suffix before the block closes. WebSearch arguments are sanitized
+		// and emitted at output_item.done instead.
+		state := getOrCreateAnthropicToResponsesStreamState(ctx)
+		if state.passthrough || bifrostResp.Arguments == nil || *bifrostResp.Arguments == "" ||
+			(bifrostResp.ItemID != nil && state.webSearchItemIDs[*bifrostResp.ItemID]) {
+			return nil
+		}
+		blockIndex, ok := state.blockIndexByItem[reverseStreamItemKey(bifrostResp)]
+		if !ok {
+			return nil
+		}
+		if blockType := state.blockType(blockIndex); blockType != AnthropicContentBlockTypeToolUse &&
+			blockType != AnthropicContentBlockTypeMCPToolUse {
+			return nil
+		}
+		missing, ok := state.missingTerminalSuffix(blockIndex, *bifrostResp.Arguments)
+		if !ok {
+			return nil
+		}
+		streamResp.Type = AnthropicStreamEventTypeContentBlockDelta
+		streamResp.Index = schemas.Ptr(blockIndex)
+		streamResp.Delta = &AnthropicStreamDelta{
+			Type:        AnthropicStreamDeltaTypeInputJSON,
+			PartialJSON: schemas.Ptr(missing),
 		}
 
 	case schemas.ResponsesStreamResponseTypeReasoningSummaryTextDelta, schemas.ResponsesStreamResponseTypeReasoningTextDelta:
@@ -3925,7 +3964,7 @@ func toAnthropicResponsesStreamEvents(ctx *schemas.BifrostContext, bifrostResp *
 		return nil
 
 	case schemas.ResponsesStreamResponseTypeOutputItemDone:
-		getOrCreateAnthropicToResponsesStreamState(ctx).clearEmittedTextProgress(reverseStreamItemKey(bifrostResp))
+		getOrCreateAnthropicToResponsesStreamState(ctx).clearEmittedDeltaProgress(reverseStreamItemKey(bifrostResp))
 		if isVerbatimToolSearchItem(bifrostResp.Item) {
 			return openAIToolSearchItemStreamEvents(ctx, bifrostResp)
 		}
