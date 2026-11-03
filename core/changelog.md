@@ -1,0 +1,1 @@
+- fix: anthropic - synthesize missing tool input suffix from *_arguments.done (#9296) [@libiris-0](https://github.com/libiris-0)
