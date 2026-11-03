@@ -1,0 +1,140 @@
+name: Iris Build
+
+# Builds the gateway image from this fork's iris branch: an upstream transports/vX.Y.Z
+# release tag plus a few fixes on top. Each build is published as vX.Y.Z-irisN, where
+# irisN counts builds on one upstream version, and as latest. The GitHub release,
+# which also creates the iris/ tag, comes last: a run that fails before it leaves no
+# tag, and re-running it simply redoes the build. Put [skip ci] in a commit message
+# to push without building.
+on:
+  push:
+    branches: [iris]
+
+concurrency:
+  group: iris-build
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  detect-changes:
+    runs-on: ubuntu-24.04
+    outputs:
+      needs-release: ${{ steps.detect.outputs.needs-release }}
+      upstream: ${{ steps.detect.outputs.upstream }}
+      version: ${{ steps.detect.outputs.version }}
+      image: ${{ steps.detect.outputs.image }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+      - name: Detect version
+        id: detect
+        run: |
+          set -euo pipefail
+          upstream=$(tr -d '\n\r' < transports/version)
+          if git tag --points-at HEAD -l "iris/v${upstream}-iris*" | grep -q .; then
+            echo "HEAD is already released"
+            echo "needs-release=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          previous=$(git tag -l "iris/v${upstream}-iris*" | sort -V | tail -1)
+          n=${previous##*-iris}
+          {
+            echo "needs-release=true"
+            echo "upstream=${upstream}"
+            echo "version=v${upstream}-iris$(( ${n:-0} + 1 ))"
+            echo "image=ghcr.io/${GITHUB_REPOSITORY,,}"
+          } | tee -a "$GITHUB_OUTPUT"
+
+  docker-build:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.needs-release == 'true'
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Set up Docker Buildx
+        uses: step-security/setup-buildx-action@f931205d68723ad9589fd2a7e2ece238bf9de341 # v4.0.0
+      - name: Log in to GitHub Container Registry
+        uses: step-security/docker-login-action@870af644803bf9f204aed474adbad2958fec048b # v4.1.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Build and push
+        uses: step-security/docker-build-push-action@846549baaf047e867d038826129a64d81df0f704 # v7.1.0
+        with:
+          context: .
+          file: ./transports/Dockerfile.local
+          build-args: VERSION=${{ needs.detect-changes.outputs.upstream }}
+          platforms: linux/${{ matrix.arch }}
+          push: true
+          tags: ${{ needs.detect-changes.outputs.image }}:${{ needs.detect-changes.outputs.version }}-${{ matrix.arch }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ needs.detect-changes.outputs.version }}
+          cache-from: type=gha,scope=${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
+
+  docker-manifest:
+    needs: [detect-changes, docker-build]
+    runs-on: ubuntu-24.04
+    permissions:
+      packages: write
+    steps:
+      - name: Set up Docker Buildx
+        uses: step-security/setup-buildx-action@f931205d68723ad9589fd2a7e2ece238bf9de341 # v4.0.0
+      - name: Log in to GitHub Container Registry
+        uses: step-security/docker-login-action@870af644803bf9f204aed474adbad2958fec048b # v4.1.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Create multi-arch manifest
+        env:
+          IMAGE: ${{ needs.detect-changes.outputs.image }}
+          VERSION: ${{ needs.detect-changes.outputs.version }}
+        run: |
+          docker buildx imagetools create -t "${IMAGE}:${VERSION}" -t "${IMAGE}:latest" \
+            "${IMAGE}:${VERSION}-amd64" "${IMAGE}:${VERSION}-arm64"
+
+  bifrost-http-release:
+    needs: [detect-changes, docker-manifest]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+      - name: Create release and tag
+        env:
+          BASE: transports/v${{ needs.detect-changes.outputs.upstream }}
+          VERSION: ${{ needs.detect-changes.outputs.version }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # Tags released upstream after the fork was created are not in the fork.
+          git rev-parse -q --verify "refs/tags/${BASE}" >/dev/null ||
+            git fetch --no-tags https://github.com/maximhq/bifrost.git "refs/tags/${BASE}:refs/tags/${BASE}"
+          {
+            echo "Based on ${BASE}."
+            echo
+            git log --reverse --format='- %s' "${BASE}..HEAD" -- . ':(exclude).github/workflows/iris-build.yml'
+          } > notes.md
+          gh release create "iris/${VERSION}" --target "$GITHUB_SHA" --title "$VERSION" --notes-file notes.md
