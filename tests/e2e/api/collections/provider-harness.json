@@ -303817,6 +303817,270 @@
           }
         }
       ]
+    },
+    {
+      "name": "305. Anthropic stream tool input carried only by arguments.done (anthropic-tool-input-done)",
+      "description": "Responses -> Anthropic stream conversion (core/providers/anthropic/responses.go, toAnthropicResponsesStreamEvents).\n\nOpenAI may stream a function call with no response.function_call_arguments.delta at all and carry the arguments only on the cumulative response.function_call_arguments.done (and output_item.done). The ChatGPT Codex backend was observed doing this on every turn with two or more parallel calls. The Anthropic egress converted only the deltas and dropped *_arguments.done, so each tool_use block went out as content_block_start (input {}) + content_block_stop and clients such as Claude Code rejected the call for missing required parameters. Anthropic has no event that carries a completed tool input, so the fix treats *_arguments.done like output_text.done: it emits, as input_json_delta, only the verified suffix the deltas have not delivered.\n\n305.1 pins the reported shape: several parallel calls, each block closing with its complete input. 305.2 pins the common path: a single call whose deltas already carried the input must not receive it a second time (a duplicate makes the input invalid JSON). 305.3 mixes a plain function (WebFetch) with WebSearch, whose arguments keep their own sanitize-and-emit path at output_item.done, so neither may be lost or duplicated.",
+      "item": [
+        {
+          "name": "305.1 openai/gpt-6.1-sol /anthropic/v1/messages stream parallel function calls carry complete input",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"model\": \"openai/gpt-6.1-sol\",\n  \"max_tokens\": 400,\n  \"stream\": true,\n  \"messages\": [\n    {\n      \"role\": \"user\",\n      \"content\": \"Read these three files in parallel with three Read calls in one turn: /etc/hostname, /etc/os-release, /etc/fstab. Do not write any text first.\"\n    }\n  ],\n  \"tools\": [\n    {\n      \"name\": \"Read\",\n      \"description\": \"Read a file from the local filesystem.\",\n      \"input_schema\": {\n        \"type\": \"object\",\n        \"properties\": {\n          \"file_path\": {\n            \"type\": \"string\",\n            \"description\": \"Absolute path of the file to read\"\n          }\n        },\n        \"required\": [\n          \"file_path\"\n        ]\n      }\n    }\n  ]\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/anthropic/v1/messages",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "anthropic",
+                "v1",
+                "messages"
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('request succeeded', function () {",
+                  "  pm.expect(pm.response.code, 'unexpected status: ' + pm.response.text()).to.eql(200);",
+                  "});",
+                  "if (pm.response.code !== 200) { return; }",
+                  "var events = [];",
+                  "pm.response.text().split('\\n').forEach(function (line) {",
+                  "  var trimmed = line.trim();",
+                  "  if (trimmed.indexOf('data:') !== 0) { return; }",
+                  "  var payload = trimmed.slice(5).trim();",
+                  "  if (!payload || payload === '[DONE]') { return; }",
+                  "  try { events.push(JSON.parse(payload)); } catch (e) { /* non-JSON keepalive */ }",
+                  "});",
+                  "var dump = JSON.stringify(events.map(function (e) { return e.type + (e.index !== undefined ? '@' + e.index : ''); })).slice(0, 1200);",
+                  "var uses = {};",
+                  "var lateDeltas = 0;",
+                  "events.forEach(function (e) {",
+                  "  if (e.type === 'content_block_start' && e.content_block && e.content_block.type === 'tool_use') {",
+                  "    uses[e.index] = { id: e.content_block.id, name: e.content_block.name, input: '', stopped: false };",
+                  "  } else if (e.type === 'content_block_delta' && uses[e.index] && e.delta && e.delta.type === 'input_json_delta') {",
+                  "    if (uses[e.index].stopped) { lateDeltas++; }",
+                  "    uses[e.index].input += e.delta.partial_json || '';",
+                  "  } else if (e.type === 'content_block_stop' && uses[e.index]) {",
+                  "    uses[e.index].stopped = true;",
+                  "  }",
+                  "});",
+                  "var list = Object.keys(uses).map(function (k) { return uses[k]; });",
+                  "function parsedInput(u) {",
+                  "  var input = null;",
+                  "  try { input = JSON.parse(u.input); } catch (e) { input = null; }",
+                  "  return input;",
+                  "}",
+                  "pm.test('every tool_use closes with its input complete and sent once', function () {",
+                  "  pm.expect(lateDeltas, 'input_json_delta after content_block_stop, events: ' + dump).to.eql(0);",
+                  "  list.forEach(function (u) {",
+                  "    pm.expect(u.stopped, 'block never closed: ' + JSON.stringify(u)).to.be.true;",
+                  "    pm.expect(u.id, 'tool_use without id: ' + JSON.stringify(u)).to.be.a('string').and.not.empty;",
+                  "    pm.expect(parsedInput(u), 'input is not one JSON object (empty or duplicated): ' + JSON.stringify(u)).to.be.an('object');",
+                  "  });",
+                  "});",
+                  "pm.test('the model made at least 2 Read call(s)', function () {",
+                  "  pm.expect(list.length, 'events: ' + dump).to.be.at.least(2);",
+                  "});",
+                  "pm.test('every Read input carries file_path', function () {",
+                  "  list.forEach(function (u) {",
+                  "    var input = parsedInput(u) || {};",
+                  "    pm.expect(input.file_path, 'Read without file_path: ' + JSON.stringify(u)).to.be.a('string').and.not.empty;",
+                  "  });",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "305.2 openai/gpt-6.1-sol /anthropic/v1/messages stream single function call input is not duplicated",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"model\": \"openai/gpt-6.1-sol\",\n  \"max_tokens\": 400,\n  \"stream\": true,\n  \"messages\": [\n    {\n      \"role\": \"user\",\n      \"content\": \"Read /etc/hostname with the Read tool. Do not write any text first.\"\n    }\n  ],\n  \"tools\": [\n    {\n      \"name\": \"Read\",\n      \"description\": \"Read a file from the local filesystem.\",\n      \"input_schema\": {\n        \"type\": \"object\",\n        \"properties\": {\n          \"file_path\": {\n            \"type\": \"string\",\n            \"description\": \"Absolute path of the file to read\"\n          }\n        },\n        \"required\": [\n          \"file_path\"\n        ]\n      }\n    }\n  ]\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/anthropic/v1/messages",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "anthropic",
+                "v1",
+                "messages"
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('request succeeded', function () {",
+                  "  pm.expect(pm.response.code, 'unexpected status: ' + pm.response.text()).to.eql(200);",
+                  "});",
+                  "if (pm.response.code !== 200) { return; }",
+                  "var events = [];",
+                  "pm.response.text().split('\\n').forEach(function (line) {",
+                  "  var trimmed = line.trim();",
+                  "  if (trimmed.indexOf('data:') !== 0) { return; }",
+                  "  var payload = trimmed.slice(5).trim();",
+                  "  if (!payload || payload === '[DONE]') { return; }",
+                  "  try { events.push(JSON.parse(payload)); } catch (e) { /* non-JSON keepalive */ }",
+                  "});",
+                  "var dump = JSON.stringify(events.map(function (e) { return e.type + (e.index !== undefined ? '@' + e.index : ''); })).slice(0, 1200);",
+                  "var uses = {};",
+                  "var lateDeltas = 0;",
+                  "events.forEach(function (e) {",
+                  "  if (e.type === 'content_block_start' && e.content_block && e.content_block.type === 'tool_use') {",
+                  "    uses[e.index] = { id: e.content_block.id, name: e.content_block.name, input: '', stopped: false };",
+                  "  } else if (e.type === 'content_block_delta' && uses[e.index] && e.delta && e.delta.type === 'input_json_delta') {",
+                  "    if (uses[e.index].stopped) { lateDeltas++; }",
+                  "    uses[e.index].input += e.delta.partial_json || '';",
+                  "  } else if (e.type === 'content_block_stop' && uses[e.index]) {",
+                  "    uses[e.index].stopped = true;",
+                  "  }",
+                  "});",
+                  "var list = Object.keys(uses).map(function (k) { return uses[k]; });",
+                  "function parsedInput(u) {",
+                  "  var input = null;",
+                  "  try { input = JSON.parse(u.input); } catch (e) { input = null; }",
+                  "  return input;",
+                  "}",
+                  "pm.test('every tool_use closes with its input complete and sent once', function () {",
+                  "  pm.expect(lateDeltas, 'input_json_delta after content_block_stop, events: ' + dump).to.eql(0);",
+                  "  list.forEach(function (u) {",
+                  "    pm.expect(u.stopped, 'block never closed: ' + JSON.stringify(u)).to.be.true;",
+                  "    pm.expect(u.id, 'tool_use without id: ' + JSON.stringify(u)).to.be.a('string').and.not.empty;",
+                  "    pm.expect(parsedInput(u), 'input is not one JSON object (empty or duplicated): ' + JSON.stringify(u)).to.be.an('object');",
+                  "  });",
+                  "});",
+                  "pm.test('the model made at least 1 Read call(s)', function () {",
+                  "  pm.expect(list.length, 'events: ' + dump).to.be.at.least(1);",
+                  "});",
+                  "pm.test('every Read input carries file_path', function () {",
+                  "  list.forEach(function (u) {",
+                  "    var input = parsedInput(u) || {};",
+                  "    pm.expect(input.file_path, 'Read without file_path: ' + JSON.stringify(u)).to.be.a('string').and.not.empty;",
+                  "  });",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "305.3 openai/gpt-6.1-sol /anthropic/v1/messages stream parallel WebFetch and WebSearch carry complete input",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"model\": \"openai/gpt-6.1-sol\",\n  \"max_tokens\": 400,\n  \"stream\": true,\n  \"messages\": [\n    {\n      \"role\": \"user\",\n      \"content\": \"In one turn, in parallel: fetch https://example.com with WebFetch (prompt: Summarize the page) and search the web for 'bifrost gateway' with WebSearch. Do not write any text first.\"\n    }\n  ],\n  \"tools\": [\n    {\n      \"name\": \"WebFetch\",\n      \"description\": \"Fetch a URL and answer a prompt about its content.\",\n      \"input_schema\": {\n        \"type\": \"object\",\n        \"properties\": {\n          \"url\": {\n            \"type\": \"string\"\n          },\n          \"prompt\": {\n            \"type\": \"string\"\n          }\n        },\n        \"required\": [\n          \"url\",\n          \"prompt\"\n        ]\n      }\n    },\n    {\n      \"name\": \"WebSearch\",\n      \"description\": \"Search the web.\",\n      \"input_schema\": {\n        \"type\": \"object\",\n        \"properties\": {\n          \"query\": {\n            \"type\": \"string\"\n          }\n        },\n        \"required\": [\n          \"query\"\n        ]\n      }\n    }\n  ]\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/anthropic/v1/messages",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "anthropic",
+                "v1",
+                "messages"
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('request succeeded', function () {",
+                  "  pm.expect(pm.response.code, 'unexpected status: ' + pm.response.text()).to.eql(200);",
+                  "});",
+                  "if (pm.response.code !== 200) { return; }",
+                  "var events = [];",
+                  "pm.response.text().split('\\n').forEach(function (line) {",
+                  "  var trimmed = line.trim();",
+                  "  if (trimmed.indexOf('data:') !== 0) { return; }",
+                  "  var payload = trimmed.slice(5).trim();",
+                  "  if (!payload || payload === '[DONE]') { return; }",
+                  "  try { events.push(JSON.parse(payload)); } catch (e) { /* non-JSON keepalive */ }",
+                  "});",
+                  "var dump = JSON.stringify(events.map(function (e) { return e.type + (e.index !== undefined ? '@' + e.index : ''); })).slice(0, 1200);",
+                  "var uses = {};",
+                  "var lateDeltas = 0;",
+                  "events.forEach(function (e) {",
+                  "  if (e.type === 'content_block_start' && e.content_block && e.content_block.type === 'tool_use') {",
+                  "    uses[e.index] = { id: e.content_block.id, name: e.content_block.name, input: '', stopped: false };",
+                  "  } else if (e.type === 'content_block_delta' && uses[e.index] && e.delta && e.delta.type === 'input_json_delta') {",
+                  "    if (uses[e.index].stopped) { lateDeltas++; }",
+                  "    uses[e.index].input += e.delta.partial_json || '';",
+                  "  } else if (e.type === 'content_block_stop' && uses[e.index]) {",
+                  "    uses[e.index].stopped = true;",
+                  "  }",
+                  "});",
+                  "var list = Object.keys(uses).map(function (k) { return uses[k]; });",
+                  "function parsedInput(u) {",
+                  "  var input = null;",
+                  "  try { input = JSON.parse(u.input); } catch (e) { input = null; }",
+                  "  return input;",
+                  "}",
+                  "pm.test('every tool_use closes with its input complete and sent once', function () {",
+                  "  pm.expect(lateDeltas, 'input_json_delta after content_block_stop, events: ' + dump).to.eql(0);",
+                  "  list.forEach(function (u) {",
+                  "    pm.expect(u.stopped, 'block never closed: ' + JSON.stringify(u)).to.be.true;",
+                  "    pm.expect(u.id, 'tool_use without id: ' + JSON.stringify(u)).to.be.a('string').and.not.empty;",
+                  "    pm.expect(parsedInput(u), 'input is not one JSON object (empty or duplicated): ' + JSON.stringify(u)).to.be.an('object');",
+                  "  });",
+                  "});",
+                  "pm.test('the model called both WebFetch and WebSearch', function () {",
+                  "  var names = list.map(function (u) { return u.name; });",
+                  "  pm.expect(names, 'events: ' + dump).to.include('WebFetch');",
+                  "  pm.expect(names, 'events: ' + dump).to.include('WebSearch');",
+                  "});",
+                  "pm.test('WebFetch carries url and WebSearch carries query', function () {",
+                  "  list.forEach(function (u) {",
+                  "    var input = parsedInput(u) || {};",
+                  "    if (u.name === 'WebFetch') { pm.expect(input.url, 'WebFetch without url: ' + JSON.stringify(u)).to.be.a('string').and.not.empty; }",
+                  "    if (u.name === 'WebSearch') { pm.expect(input.query, 'WebSearch without query: ' + JSON.stringify(u)).to.be.a('string').and.not.empty; }",
+                  "  });",
+                  "});"
+                ]
+              }
+            }
+          ]
+        }
+      ]
     }
   ]
 }

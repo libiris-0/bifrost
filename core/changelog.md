@@ -1,1 +1,2 @@
+- fix: anthropic - synthesize missing tool input suffix from *_arguments.done (#9296) [@libiris-0](https://github.com/libiris-0)
 - fix: anthropic - Responses requests drop empty text blocks instead of forwarding them for a 400 (#9318) [@david-choi-querypie](https://github.com/david-choi-querypie)
